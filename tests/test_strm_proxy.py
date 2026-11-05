@@ -5,6 +5,10 @@
 """
 
 import unittest
+import http.client
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread
+from unittest.mock import patch, Mock
 from types import SimpleNamespace
 
 from plugin_env import (
@@ -255,6 +259,186 @@ class TestProxyTemplateSelection(unittest.TestCase):
     def test_base_url_normalized(self):
         base, _ = StrmGenerator.build_proxy_template("http://mp:9527/", "pickcode")
         self.assertEqual(base, "http://mp:9527")
+
+
+class TestRangeStreamFailure(unittest.TestCase):
+    def make_stream(self):
+        first = Mock(headers={"ETag": '"v1"'})
+        first.read.return_value = b"abcd"
+        stream = _proxy._RangeStream(first, "http://upstream/video", {}, 0, 3, 7, 8)
+        self.assertEqual(stream.read(), b"abcd")
+        return first, stream
+
+    def test_changed_file_stops_and_closes_next_response(self):
+        first, stream = self.make_stream()
+        second = Mock(status=200, headers={})
+        with patch.object(_proxy, "urlopen", return_value=second):
+            with self.assertRaises(OSError):
+                stream.read()
+        first.close.assert_called_once()
+        second.close.assert_called_once()
+
+    def test_http_error_response_is_closed(self):
+        _, stream = self.make_stream()
+        from urllib.error import HTTPError
+        error = HTTPError("http://upstream/video", 412, "changed", {}, Mock())
+        with patch.object(_proxy, "urlopen", side_effect=error), patch.object(error, "close") as close:
+            with self.assertRaises(OSError):
+                stream.read()
+            close.assert_called_once()
+
+    def test_disconnect_does_not_fetch_more(self):
+        first, stream = self.make_stream()
+        stream.close()
+        with patch.object(_proxy, "urlopen") as open_next:
+            self.assertEqual(stream.read(), b"")
+            open_next.assert_not_called()
+        first.close.assert_called_once()
+
+    def test_truncated_part_is_rejected(self):
+        first, stream = self.make_stream()
+        stream._remaining = 1
+        first.read.return_value = b""
+        with self.assertRaises(OSError):
+            stream.read()
+
+
+class TestQuarkRelay(unittest.TestCase):
+    """真实 HTTP 链路验证：认证只发上游，Range/HEAD 与错误码保持一致。"""
+
+    def setUp(self):
+        self.payload = b"0123456789abcdefghijklmnopqrstuvwxyz"
+        self.received = []
+        test = self
+
+        class Upstream(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.respond()
+
+            def do_HEAD(self):
+                self.respond()
+
+            def respond(self):
+                test.received.append(dict(self.headers))
+                if self.headers.get("Cookie") != "session=secret" or self.headers.get("User-Agent") != "Quark-PC":
+                    self.send_response(412)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                data = test.payload
+                range_value = self.headers.get("Range")
+                code = 200
+                if range_value:
+                    low, high = range_value.removeprefix("bytes=").split("-", 1)
+                    start = int(low) if low else max(0, len(data) - int(high))
+                    end = min(int(high), len(data) - 1) if low and high else len(data) - 1
+                    code = 206 if start < len(data) else 416
+                    self.send_response(code)
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{len(data)}" if code == 206 else f"bytes */{len(data)}")
+                    data = data[start:end + 1] if code == 206 else b""
+                else:
+                    self.send_response(code)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Content-Type", "video/mp4")
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("ETag", '"version-one"')
+                self.send_header("Set-Cookie", "do-not-expose=secret")
+                self.end_headers()
+                if self.command != "HEAD":
+                    self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+
+        self.upstream = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+        drive = StubDrive(url=f"http://127.0.0.1:{self.upstream.server_port}/video",
+                          playback_variables=("file_id",), proxy_identifier="file_id")
+        drive.resolve_download_link = lambda item: (drive.url, {"Cookie": "session=secret", "User-Agent": "Quark-PC"})
+        self.owner = SimpleNamespace(_applied_config={"strm_proxy_enabled": True, "cloud_drive": "quark"},
+                                     _cloud_drive=drive)
+        server = StrmProxyServer(self.owner, 0)
+        self.proxy = ThreadingHTTPServer(("127.0.0.1", 0), server._make_handler())
+        self.threads = []
+        for httpd in [self.upstream, self.proxy]:
+            thread = Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            self.threads.append(thread)
+
+    def tearDown(self):
+        for server in [self.proxy, self.upstream]:
+            server.shutdown()
+            server.server_close()
+        for thread in self.threads:
+            thread.join(timeout=2)
+
+    def fetch(self, method="GET", headers=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.proxy.server_port, timeout=5)
+        try:
+            conn.request(method, "/d/file-id", headers=headers or {})
+            response = conn.getresponse()
+            return response.status, dict(response.getheaders()), response.read()
+        finally:
+            conn.close()
+
+    def test_get_uses_private_headers_and_streams_body(self):
+        code, headers, body = self.fetch(headers={"Cookie": "attacker", "User-Agent": "TV-client"})
+        self.assertEqual((code, body), (200, self.payload))
+        self.assertNotIn("Set-Cookie", headers)
+        self.assertNotIn("Location", headers)
+        self.assertNotIn("secret", str(headers))
+        self.assertEqual(self.received[0]["Accept-Encoding"], "identity")
+
+    def test_range_and_if_range_are_forwarded(self):
+        for value, expected in [("bytes=2-5", self.payload[2:6]), ("bytes=8-", self.payload[8:]),
+                                ("bytes=-5", self.payload[-5:])]:
+            with self.subTest(range=value):
+                code, headers, body = self.fetch(headers={"Range": value, "If-Range": '"version-one"'})
+                self.assertEqual((code, body), (206, expected))
+                self.assertEqual(int(headers["Content-Length"]), len(expected))
+                self.assertEqual(headers["Accept-Ranges"], "bytes")
+                self.assertIn("Content-Range", headers)
+                self.assertEqual(self.received[-1]["If-Range"], '"version-one"')
+
+    def test_head_returns_upstream_length_without_body(self):
+        code, headers, body = self.fetch("HEAD")
+        self.assertEqual((code, body), (200, b""))
+        self.assertEqual(int(headers["Content-Length"]), len(self.payload))
+
+    def test_segmented_requests_preserve_complete_client_range(self):
+        for value, start, end in [(None, 0, 35), ("bytes=2-", 2, 35),
+                                  ("bytes=3-25", 3, 25)]:
+            with self.subTest(range=value), patch.object(_proxy, "_RELAY_CHUNK_SIZE", 8):
+                self.received.clear()
+                code, headers, body = self.fetch(headers={"Range": value} if value else {})
+                self.assertEqual(code, 206 if value else 200)
+                self.assertEqual(body, self.payload[start:end + 1])
+                self.assertEqual(int(headers["Content-Length"]), end - start + 1)
+                if value:
+                    self.assertEqual(headers["Content-Range"], f"bytes {start}-{end}/36")
+                else:
+                    self.assertNotIn("Content-Range", headers)
+                expected = [f"bytes={low}-{min(low + 7, end)}"
+                            for low in range(start, end + 1, 8)]
+                self.assertEqual([h["Range"] for h in self.received], expected)
+                for request in self.received[1:]:
+                    self.assertEqual(request["If-Range"], '"version-one"')
+
+
+    def test_unsatisfiable_range_keeps_416(self):
+        code, headers, body = self.fetch(headers={"Range": "bytes=999-"})
+        self.assertEqual((code, body), (416, b""))
+        self.assertEqual(headers["Content-Range"], f"bytes */{len(self.payload)}")
+
+    def test_rejected_upstream_is_not_reported_as_success(self):
+        self.owner._cloud_drive.resolve_download_link = lambda item: (self.owner._cloud_drive.url, {})
+        code, _, body = self.fetch()
+        self.assertEqual((code, body), (412, b""))
+
+    def test_connection_error_returns_502_without_private_url(self):
+        with patch.object(_proxy, "urlopen", side_effect=OSError("private-signed-url")):
+            code, _, body = self.fetch()
+        self.assertEqual(code, 502)
+        self.assertNotIn(b"private-signed-url", body)
 
 
 class TestSharedPlaybackReference(unittest.TestCase):
